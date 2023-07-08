@@ -1,0 +1,125 @@
+variables:
+  AWS_REGION: "us-east-1"
+  SPR_APP_NAME: $CI_PROJECT_NAME
+  TAG_ENV_DEV: dev
+  TAG_ENV_QA: qa
+  TAG_ENV_STG: stg
+  TAG_ENV_PROD: prod
+
+stages:
+  - build
+  - deploy
+  - event
+
+build:
+  stage: build
+  image: harbor.rd.com.br/devops/rd-maven:3-openjdk-11
+  variables:
+    TAG_ENV: $TAG_ENV_DEV
+    AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID_DEV
+    AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY_DEV
+    AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION_DEV
+    BUCKET_NAME: $SPR_APP_NAME-$TAG_ENV
+    AWS_REGION: $AWS_DEFAULT_REGION_DEV
+  script:
+    - apt update > /dev/null
+    - apt upgrade -y -q > /dev/null
+    - apt install -y sed
+    - sed "s/\(https:\/\/-\)[^.]*\(\.io\/v1\/api\/\)\([^?]*\)\(\?.*\)\?\//https:\/\/$TAG_ENV..io\/v1\/api\/\3\4\//g" index.js > index.js.tmp && mv index.js.tmp index.js 
+    - apt install -y zip
+    - zip -rq $SPR_APP_NAME.zip * -x .gitlab-ci.yml 
+  artifacts:
+    paths:
+      - $SPR_APP_NAME.zip
+  tags:
+    - docker-saas
+  only:
+    - develop
+
+deploy:
+  image: harbor.rd.com.br/devops/rd-dind-aws:2.2.0
+  stage: deploy
+  variables:
+    TAG_ENV: $TAG_ENV_DEV
+    AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID_DEV
+    AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY_DEV
+    AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION_DEV
+    BUCKET_NAME: $SPR_APP_NAME-$TAG_ENV
+    AWS_REGION: $AWS_DEFAULT_REGION_DEV
+    CLIENT_ID: $CLIENT_ID_DEV
+    SCOPE: $SCOPE_DEV
+    GRANT_TYPE: $GRANT_TYPE_DEV
+    CLIENT_SECRET: $CLIENT_SECRET_DEV
+  script:
+    - |
+      if aws s3api head-bucket --bucket $BUCKET_NAME --region $AWS_REGION 2>/dev/null; then
+        echo "S3 bucket $BUCKET_NAME already exists."
+      else
+        echo "S3 bucket $BUCKET_NAME does not exist. Creating..."
+        aws s3 mb s3://$BUCKET_NAME --region $AWS_REGION
+      fi
+    - aws s3 cp $SPR_APP_NAME.zip s3://$BUCKET_NAME/
+    - FUNCTION_EXISTS=$(aws lambda get-function --function-name $BUCKET_NAME --region $AWS_REGION --query 'Code.Location' --output text | grep -q 'http' && echo "true" || echo "false")
+    - if [ $FUNCTION_EXISTS == "false" ]; then 
+        aws lambda create-function --function-name $BUCKET_NAME --runtime nodejs14.x --handler index.handler --role arn:aws:iam::005966896332:role/role-lambda-pipe --code S3Bucket=$BUCKET_NAME,S3Key=$SPR_APP_NAME.zip; 
+        aws lambda update-function-configuration --function-name $BUCKET_NAME --environment "Variables={client_id=$CLIENT_ID, client_secret=$CLIENT_SECRET, grant_type=$GRANT_TYPE, scope=$SCOPE}";
+      fi
+    - if [ $FUNCTION_EXISTS == "true" ]; then 
+        aws lambda update-function-code --function-name $BUCKET_NAME --s3-bucket $BUCKET_NAME --s3-key $SPR_APP_NAME.zip --region $AWS_REGION; 
+        aws lambda update-function-configuration --function-name $BUCKET_NAME --environment "Variables={client_id=$CLIENT_ID, client_secret=$CLIENT_SECRET, grant_type=$GRANT_TYPE, scope=$SCOPE}";
+      fi
+  tags:
+    - docker-saas
+  only:
+    - develop
+
+event:
+  stage: event
+  image: harbor.rd.com.br/devops/rd-dind-aws:2.2.0
+  variables:
+    TAG_ENV: $TAG_ENV_DEV
+    AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID_DEV
+    AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY_DEV
+    AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION_DEV
+    AWS_REGION: $AWS_DEFAULT_REGION_DEV
+    RULE_NAME: "event-sync-$SPR_APP_NAME"
+    CRON_EXPRESSION: "cron(0 12 ? * MON-FRI *)"
+    ENTITY_SERVICE_PRINCIPAL: "events.amazonaws.com"
+    RULE_DESCRIPTION: "event da lambda."
+    BUCKET_NAME: $SPR_APP_NAME-$TAG_ENV
+  script:
+    - aws events put-rule --name "$RULE_NAME" --schedule-expression "$CRON_EXPRESSION" --event-pattern "{\"source\":[\"aws.lambda\"],\"detail-type\":[\"AWS API Call via CloudTrail\"],\"detail\":{\"eventSource\":[\"lambda.amazonaws.com\"],\"eventName\":[\"UpdateFunctionConfiguration\",\"CreateFunction\",\"DeleteFunction\"],\"requestParameters\":{\"functionName\":[\"$BUCKET_NAME\"]}}}" --description "$RULE_DESCRIPTION" --role-arn "arn:aws:iam::005966896332:role/role-lambda-pipe"
+    - echo "Event rule created"
+    - aws events put-targets --rule "$RULE_NAME" --targets "Id"="1","Arn"="arn:aws:lambda:us-east-1:005966896332:function:$BUCKET_NAME"
+    - |
+      if aws lambda get-policy --function-name "$BUCKET_NAME" | grep -q "$RULE_NAME" > /dev/null; then
+        echo "The trigger already exists. No action needed."
+      else
+        echo "The trigger doesn't exist. It will be created."  
+        aws lambda add-permission --function-name "$BUCKET_NAME" --statement-id $RULE_NAME --action 'lambda:InvokeFunction' --principal events.amazonaws.com --source-arn arn:aws:events:us-east-1:005966896332:rule/$RULE_NAME
+      fi
+    - |
+      # Enable CloudWatch logs for the Lambda function
+      aws lambda update-function-configuration --function-name $BUCKET_NAME --region $AWS_REGION --tracing-config Mode=Active
+    # Create a log group for the Lambda function (ignoring if it already exists)
+    - aws logs create-log-group --log-group-name /aws/lambda/$BUCKET_NAME || true
+    - |
+      # Query CloudWatch Logs Insights
+      QUERY='fields @timestamp, @message
+      | sort @timestamp desc
+      | limit 20'
+      LOG_GROUP="/aws/lambda/$BUCKET_NAME"
+#      OUTPUT=$(aws logs start-query --log-group-name "$LOG_GROUP" --start-time $(date +%s%3N --date '1 hour ago') --end-time $(date +%s%3N) --query-string "$QUERY" --output text)
+#      QUERY_ID=$(echo $OUTPUT | awk '{print $1}')
+#      STATUS=""
+#      while [[ "$STATUS" != "Complete" ]]; do
+#        OUTPUT=$(aws logs get-query-results --query-id "$QUERY_ID" --output text)
+#        STATUS=$(echo $OUTPUT | awk '{print $1}')
+#        sleep 1
+#      done
+#      RESULTS=$(aws logs get-query-results --query-id "$QUERY_ID" --output json)
+#      echo $RESULTS
+  tags:
+    - docker-saas
+  only:
+    - develop
